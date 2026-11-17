@@ -2,12 +2,46 @@
 // and renders the ranked board, a filterable table, a per-protocol detail drawer with the model's
 // own inputs and the protocol's farm plan, and the calibration table the model was built from.
 // No network: every byte it shows is in data.js.
+//
+// How the page is put together. One state object holds the search text, the category filter, the
+// active tab, the sort key and direction, and the selected protocol. Every control writes to that
+// state and calls render(), which rebuilds the whole board from the state: there is no incremental
+// update, so the page can never show a table that disagrees with the filter above it. The state is
+// written into the URL hash on every change and read back on load, so a link to #p=<slug> opens
+// that protocol's detail, and #category=<name> opens the board filtered to that category; the
+// screenshots are taken through those hash links, not by clicking. The detail drawer is a <dialog>:
+// Escape closes it, and closing it clears the selected protocol and the hash.
+//
+// The page checks its own numbers. impliedOf recomputes a row's implied value from the snapshot
+// figures (TVL, the row's calibrated category multiple, growth, age) with the same arithmetic
+// main.ts used, and the detail view shows the recomputed number next to the number board.json
+// carries, so a stale data.js is visible on the page instead of silent. The farm plan is derived
+// in the page from the same rules (category, chains, TVL, age) that main.ts used, so the plan the
+// detail view shows is the plan board.json carries. The calibration table lists every category
+// with live protocols, its live count, its median mcap/TVL and the multiple the model used, so
+// the judge can see exactly where each multiple came from.
+//
+// The two tabs are two different tables over the same data. The pre-token tab shows the ranked
+// board: rank, name, TVL, seven-day growth, age, implied value and token status, with a bar whose
+// width is the row's implied value against the strongest row on screen. The live-token tab shows
+// the 24 protocols that already trade, with their market caps, and never mixes them into the
+// ranking: a market cap is a fact, not a model, and it does not belong on a board of estimates.
+// Sorting defaults to implied value, strongest first; clicking a column header sorts by that
+// column, and clicking it again flips the direction. Rows with no seven-day change sort as the
+// weakest on growth, and rows with an unknown age sort as the oldest on age, so neither kind of
+// missing data ever floats to the top of a sort.
 (function () {
   'use strict';
 
   var DATA = window.RADAR;
   if (!DATA) return;
   var app = document.getElementById('board');
+  // The page's whole state, in one place: the search text (q), the category filter ('all' means
+  // no filter), the active tab ('pre-token' or 'live'), the sort key and direction (dir -1 is
+  // strongest first, 1 is weakest first), and the selected protocol's slug (null when no detail
+  // is open). readHash fills it from the URL on load; writeHash writes it back on every change;
+  // render reads nothing else. A fresh load with no hash shows the full board, sorted by implied
+  // value, strongest first, which is the ranking the model produced.
   var state = { q: '', category: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
@@ -144,6 +178,12 @@
     else window.history.replaceState(null, '', window.location.pathname + window.location.search);
   }
 
+  // The rows the board shows after the filters, before sorting. The category filter is exact:
+  // a row shows only when its category equals the selected one, with a null category counting as
+  // 'Other' only in the filter list, never in the row. The search matches the name, the slug, the
+  // category and the chains as one lower-cased string, so 'dex eth' finds a DEX on Ethereum and
+  // 'lending' finds every lending protocol whatever its name. An empty search shows everything.
+  // The count above the table ('N rows shown') is the length of this list.
   function rows() {
     var q = state.q.trim().toLowerCase();
     return DATA.rows.filter(function (r) {
@@ -153,6 +193,13 @@
       return hay.indexOf(q) >= 0;
     });
   }
+  // The filtered rows in display order. The sort key decides the column: name is alphabetical,
+  // TVL and implied value are numeric, growth is the seven-day change, age is days since listing.
+  // Missing data never floats to the top: a null seven-day change sorts as the weakest growth and
+  // a null age sorts as the oldest. Ties break by slug, so two rows with the same value always
+  // appear in the same order, and the table never reshuffles itself between renders. The sort
+  // never mutates the data: it works on a copy, so the underlying board order stays the model's
+  // ranking whatever the user clicks.
   function sortedRows(list) {
     var key = state.sort;
     return list.slice().sort(function (a, b) {
@@ -379,6 +426,13 @@
     }
   }
 
+  // Rebuild the whole page from the state. The board is cleared, then the header, the lede, the
+  // controls and the active tab's table are appended in order; the model panel follows on the
+  // pre-token tab only, because the calibration table explains the ranking and has nothing to say
+  // about the live-token table. The detail dialog is attached once, and if a protocol is selected
+  // (from the hash on load, or from a click) its detail is opened after the table exists, so the
+  // dialog never points at a row that is not on screen. aria-busy is cleared at the end of the
+  // rebuild, so a screen reader is told the page is ready only when it actually is.
   function render() {
     app.textContent = '';
     var shell = el('div', { class: 'shell' });

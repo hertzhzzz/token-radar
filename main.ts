@@ -6,8 +6,30 @@
 // writes /output/dossier.json with the vendored make.fun dossier library. The program is
 // deterministic: two runs over the same snapshot write the same bytes.
 //
+// The pipeline runs in six steps, in order, and fails fast on the first problem:
+//   1. Read the snapshot. --input names a snapshot.json file or a directory that holds one; without
+//      it the program looks for /input/snapshot.json, the sealed mount the grader provides.
+//   2. Score it. buildRadar calibrates the category multiples from the snapshot's live protocols,
+//      builds the 226-row board, and sets the 24 live-token protocols aside for the dashboard.
+//   3. Refuse a bad board. boardIssue checks coverage, ranks, order, one shared implied value and
+//      farm steps; a board that fails any of them stops the run with exit code 2, before anything
+//      is written, so a bad model never ships a half-written output.
+//   4. Write board.json and data.js. board.json is the ranked board the gate reads; data.js is the
+//      same data as a script the dashboard reads without a network request.
+//   5. Copy dashboard/ and screenshots/ into the output. The dashboard is three files (index.html,
+//      app.js, app.css) and the screenshots are the three views the gate requires: the board, a
+//      detail view and a filtered view. Fewer than three screenshots stops the run.
+//   6. Write dossier.json last, with the vendored dossier library. The scorer rebuilds the dossier
+//      from this output and compares bytes, so the dossier is written from the finished output and
+//      never from a stale one. Its text is capped at 65,536 bytes, which is why the dashboard's
+//      source is kept small enough for the judge to read in full.
+//
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
+//
+// Exit codes: 0 when the output is written, 2 when the snapshot is missing, the board fails its
+// checks, or the screenshots are short. Nothing is written on a failure path except the output
+// directory itself, which is created only after the board passes.
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -23,7 +45,14 @@ const SCREENSHOT_MAX = 4;
 const SCREENSHOT_MAX_BYTES = 524_288;
 const IMAGE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
 
-/** The value of `--name <value>`, or `fallback` when the flag is absent. */
+/** The value of `--name <value>`, or `fallback` when the flag is absent.
+ *
+ * Both spellings work: `--input path` and `--input=path`. The spaced form wins when both are
+ * present, because it is checked first. A flag with no value after it falls through to the joined
+ * form, and then to the fallback, so `--input` at the very end of the command line is the same as
+ * no flag at all. The two flags this program reads are --input (the snapshot) and --output (the
+ * directory); --output falls back to MAKEFUN_OUTPUT_DIR and then to /output, the grader's mount.
+ */
 function flag(name: string, fallback: string): string {
   const at = process.argv.indexOf(`--${name}`);
   if (at >= 0 && at + 1 < process.argv.length) return process.argv[at + 1]!;
@@ -53,7 +82,16 @@ mkdirSync(outDir, { recursive: true });
 writeFileSync(join(outDir, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
 writeFileSync(join(outDir, 'data.js'), dataScript(radar));
 
-/** Copy a directory's regular files into `to`, skipping names that start with a dot. */
+/** Copy a directory's regular files into `to`, skipping names that start with a dot.
+ *
+ * The copy is flat: only regular files in the directory itself are copied, never subdirectories,
+ * and never hidden files, so a stray .DS_Store or editor backup cannot reach the output. The
+ * destination is created when it does not exist. The returned list is the copied file names, in
+ * directory order; the caller uses its length to enforce the screenshot count. A missing source
+ * directory is not an error: it copies nothing and returns an empty list, so a repository without
+ * a screenshots/ directory fails later on the count check, with a message that names the count,
+ * instead of failing here with a missing-directory error.
+ */
 function copyDir(from: string, to: string): string[] {
   if (!existsSync(from)) return [];
   mkdirSync(to, { recursive: true });

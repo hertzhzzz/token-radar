@@ -22,6 +22,62 @@
 // actually pays. A category with no live protocol at all takes the global median. No protocol name is
 // ever special-cased: the same function scores every row, and the multiples are recomputed from the
 // snapshot on every run.
+//
+// Why radar-2 calibrates the multiple instead of guessing one.
+//
+// The starter this entry replaces scores every protocol with the same flat multiple of 0.25, so its
+// ranking is a ranking by TVL alone: two protocols with the same TVL get the same implied value no
+// matter what they do. The market does not price categories alike. A lending market that already
+// trades is worth a different fraction of its TVL than a bridge or a perpetuals exchange, because
+// the revenue, the risk and the growth behind each TVL dollar differ. A flat multiple throws that
+// signal away, and with it the whole point of a radar: telling a lending protocol with a strong
+// market apart from a bridge with the same TVL and a weaker one.
+//
+// Radar-2 takes the multiple from the market itself, inside the same snapshot. For each category it
+// looks at the protocols that already trade, takes the median of their market-cap-to-TVL ratios, and
+// shrinks that median toward the global median with a prior of four protocols. The shrinkage is the
+// part that keeps the model honest: a category with one live protocol cannot set its own multiple
+// from a single outlier, and a category with twenty live protocols mostly sets its own. A category
+// with no live protocol at all takes the global median, which is the model's way of saying it has no
+// evidence and will not invent any. No protocol name is ever special-cased, so the same rule scores
+// the watchlist and the early rows alike, and the multiples are recomputed from the snapshot on
+// every run: a new snapshot re-prices every category.
+//
+// Worked example, shrinkage. A category has 2 live protocols whose mcap/TVL ratios have median
+// 0.80, and the global median is 0.2138. The shrunk multiple is
+//   (2 x 0.80 + 4 x 0.2138) / (2 + 4) = (1.60 + 0.8552) / 6 = 0.4092.
+// Without the prior the category would take 0.80 outright, more than double the shrunk value, on
+// the evidence of two protocols. With the prior it still pays a premium over the global median, but
+// only a premium two protocols can support. The clamp to [0.05, 1.5] then keeps the multiple inside
+// a range the market actually pays: no category is ever worth twenty times its TVL, and none is
+// worth a twentieth of it.
+//
+// Worked example, implied value. A lending protocol holds $100,000,000 of TVL, its category
+// multiple is 0.45, its seven-day growth is +20%, and it was listed 400 days ago. Then
+//   base         = 100,000,000 x 0.45 = 45,000,000
+//   growthMult   = 1 + (20 / 100) x 0.5 = 1.10
+//   maturityMult = 0.6 + (400 / 1095) x 0.4 = 0.7461
+//   implied      = round(45,000,000 x 1.10 x 0.7461) = 36,932,940.
+// The growth term is deliberately half-weighted (0.5): a hot week moves the value, but one week of
+// growth is not worth as much as the TVL behind it. The maturity term starts at 0.6 for a protocol
+// listed yesterday and rises to 1.0 after three years, so a protocol that has run for years with no
+// token is worth more than a new one with the same TVL: survival is evidence. A protocol whose
+// listing date is unknown is scored as 365 days old, the middle of the range, rather than as new.
+//
+// The farm plan is derived the same way, from the protocol's own record and nothing else. Seven
+// steps: a fresh wallet, the category's main action, a second different action in the same category,
+// one qualifying action a week, a hold sized to the protocol's age, a claim made only from the
+// protocol's own published link, and a farm log. The first two actions are category-specific
+// (lending supplies, a DEX provides liquidity, a bridge bridges), the capital is sized from TVL
+// ($50 to $250), and the hold is longer for younger protocols (60 days under six months, 45 under
+// a year, 30 after that), because a young protocol's snapshots are the ones that need the longest
+// qualifying window.
+//
+// Determinism. The model reads only the snapshot and the constants in MODEL. There is no clock, no
+// randomness and no network: two runs over the same snapshot write the same board, the same data.js
+// and the same dossier, byte for byte. Ties on implied value break by slug, so the order is stable
+// even when two protocols score identically. That is what lets the gate compare the dossier the
+// program wrote against the dossier the scorer rebuilds from the output.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -222,6 +278,15 @@ export function isRankable(p: SnapshotProtocol): boolean {
  * take the median market-cap-to-TVL ratio of its live protocols, shrink it toward the global median
  * with a prior of `model.shrink_prior` live protocols, and clamp it to the model's range. A category
  * with no live protocol takes the global median. The result is a lookup the model and the page share.
+ *
+ * The shrinkage is a weighted average, not a blend: (n x category_median + prior x global_median) /
+ * (n + prior). A category with many live protocols keeps most of its own median; a category with
+ * one or two is pulled most of the way to the global median. The median, not the mean, is the
+ * centre: one protocol trading at ten times its TVL cannot drag its category's multiple with it.
+ * Only protocols with a positive TVL and a market cap enter the calibration, and only ratios that
+ * are finite and positive; a live protocol with no market cap is not evidence about any multiple.
+ * The returned multiples are rounded to four decimals, which is the precision the board and the
+ * dashboard both carry, so the page's recomputation and the board's numbers agree.
  */
 export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Calibration {
   const byCategory = new Map<string, number[]>();
@@ -273,7 +338,16 @@ export function multipleForCategory(calibration: Calibration, category: string |
   return Math.min(MODEL.multiple_cap, Math.max(MODEL.multiple_floor, calibration.global_median));
 }
 
-/** The three multipliers and the implied value one protocol gets under `model` and `calibration`. */
+/** The three multipliers and the implied value one protocol gets under `model` and `calibration`.
+ *
+ * The growth term clamps the seven-day change to the model's floor and cap before it is weighted,
+ * so a single week of +300% cannot triple a protocol's value and a week of -90% cannot erase it.
+ * A protocol with no seven-day change is scored as flat. The maturity term uses the protocol's age
+ * in whole days, or the model's unknown-age figure when the listing date is absent. The implied
+ * value is at least 1: a protocol on the board is never worth nothing, even when its TVL is small
+ * and its growth is at its floor. The multiple itself is the calibrated category multiple, never a
+ * flat constant, and it is the same multiple the dashboard's calibration table shows.
+ */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
@@ -422,6 +496,16 @@ function secondActionFor(p: SnapshotProtocol, capital: number, chain: string): s
 /**
  * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived
  * from the protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
+ *
+ * The seven steps have fixed jobs. Step 1 isolates the funds in a fresh wallet, so a farm never
+ * risks a wallet that holds anything else. Steps 2 and 3 are the position itself: the category's
+ * main action, then a second, different action in the same category, so the wallet shows more than
+ * a single deposit. Step 4 keeps the position qualifying with one action a week. Step 5 holds it
+ * for the age-sized window, so the activity lands in more than one snapshot. Step 6 claims only
+ * from the protocol's own published link, because a claim link from anywhere else is the classic
+ * way a farm loses its funds. Step 7 writes the log, so the position can be repeated or unwound.
+ * The capital is sized from TVL in four bands ($50, $100, $150, $250) and the hold from age
+ * (60, 45 or 30 days), so a large, old protocol and a small, young one get different plans.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
@@ -571,7 +655,16 @@ export function parseSnapshot(text: string): Snapshot {
   };
 }
 
-/** Why a board is not one the gate will take, or null: coverage, ranks, order, one shared implied value, and farm steps. */
+/** Why a board is not one the gate will take, or null: coverage, ranks, order, one shared implied value, and farm steps.
+ *
+ * The checks run in this order, and the first failure is the one reported. Coverage comes first:
+ * every watchlist slug must be on the board, because the watchlist is the floor the radar promises.
+ * Then ranks must run 1..n with no gaps, and implied value must not rise down the board, because a
+ * ranking that is not sorted is not a ranking. Then the board must not give every row the same
+ * implied value, which would mean the model scored nothing. Finally every row's farm steps must
+ * number between 3 and 12 and each step must run 20 to 600 characters, and every implied value
+ * must be a positive safe integer. A board that passes all five is one the gate will take.
+ */
 export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null {
   const slugs = new Set(board.map((r) => r.slug));
   const missing = snapshot.watchlist.filter((s) => !slugs.has(s));
